@@ -408,6 +408,47 @@ class RustBPETokenizer:
         else:
             return self.enc.encode_batch(full_texts, num_threads=num_threads)
 
+    def encode_optimized4(self, text, prepend=None, append=None, num_threads=8):
+        # Pre-calculate prepend/append IDs once
+        prepend_id = prepend if isinstance(prepend, int) else self.encode_special(prepend) if prepend is not None else None
+        append_id = append if isinstance(append, int) else self.encode_special(append) if append is not None else None
+
+        # Handle single string case
+        if isinstance(text, str):
+            base_ids = self.enc.encode_ordinary(text)
+
+            # Efficiently concatenate using numpy if special tokens are present
+            if prepend_id is not None or append_id is not None:
+                parts = []
+                if prepend_id is not None:
+                    parts.append(np.array([prepend_id], dtype=np.int32))
+                parts.append(np.array(base_ids, dtype=np.int32))
+                if append_id is not None:
+                    parts.append(np.array([append_id], dtype=np.int32))
+                return np.concatenate(parts).tolist()
+            return base_ids
+
+        # Handle list of strings case (batch processing)
+        elif isinstance(text, list):
+            base_ids_list = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
+
+            # If no special tokens, return as is
+            if prepend_id is None and append_id is None:
+                return base_ids_list
+
+            # Pre-build prepend and append arrays
+            prepend_arr = np.array([prepend_id], dtype=np.int32) if prepend_id is not None else np.array([], dtype=np.int32)
+            append_arr = np.array([append_id], dtype=np.int32) if append_id is not None else np.array([], dtype=np.int32)
+
+            # Process each list of IDs
+            result_list = []
+            for base_ids in base_ids_list:
+                # Use numpy for fast concatenation
+                result_list.append(np.concatenate([prepend_arr, np.array(base_ids, dtype=np.int32), append_arr]).tolist())
+            return result_list
+
+        raise ValueError(f"Invalid input type: {type(text)}")
+
     def __call__(self, *args, **kwargs):
         return self.encode(*args, **kwargs)
 

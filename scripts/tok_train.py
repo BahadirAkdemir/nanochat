@@ -6,7 +6,7 @@ import os
 import time
 import argparse
 import torch
-from nanochat.tokenizer import RustBPETokenizer
+from nanochat.tokenizer import RustBPETokenizer, HuggingFaceTokenizer
 from nanochat.common import get_base_dir
 from nanochat.dataset import parquets_iter_batched
 
@@ -46,7 +46,10 @@ text_iter = text_iterator()
 # -----------------------------------------------------------------------------
 # Train the tokenizer
 t0 = time.time()
-tokenizer = RustBPETokenizer.train_from_iterator(text_iter, args.vocab_size)
+# text_iter is an iterator, so we can only use it once
+text_for_hf = list(text_iter)
+tokenizer_hf = HuggingFaceTokenizer.train_from_iterator(text_for_hf, args.vocab_size)
+tokenizer = RustBPETokenizer.train_from_iterator(text_for_hf, args.vocab_size)
 t1 = time.time()
 train_time = t1 - t0
 print(f"Training time: {train_time:.2f}s")
@@ -56,6 +59,7 @@ print(f"Training time: {train_time:.2f}s")
 base_dir = get_base_dir()
 tokenizer_dir = os.path.join(base_dir, "tokenizer")
 tokenizer.save(tokenizer_dir)
+tokenizer_hf.save(tokenizer_dir)
 
 # -----------------------------------------------------------------------------
 # Quick inline sanity check
