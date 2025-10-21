@@ -9,6 +9,8 @@ Two implementations are available:
 import os
 import copy
 from functools import lru_cache
+import numpy as np
+
 
 SPECIAL_TOKENS = [
     # every document begins with the Beginning of Sequence (BOS) token that delimits documents
@@ -240,6 +242,171 @@ class RustBPETokenizer:
             raise ValueError(f"Invalid input type: {type(text)}")
 
         return ids
+
+    def encode_optimized(self, text, prepend=None, append=None, num_threads=8):
+        # Resolve prepend and append tokens once
+        if prepend is not None:
+            prepend_id = prepend if isinstance(prepend, int) else self.encode_special(prepend)
+        if append is not None:
+            append_id = append if isinstance(append, int) else self.encode_special(append)
+
+        # Handle string input
+        if isinstance(text, str):
+            ids = self.enc.encode_ordinary(text)
+            if prepend is not None or append is not None:
+                new_ids = []
+                if prepend is not None:
+                    new_ids.append(prepend_id)
+                new_ids.extend(ids)
+                if append is not None:
+                    new_ids.append(append_id)
+                ids = new_ids
+            return ids
+
+        # Handle list of strings (batch mode)
+        elif isinstance(text, list):
+            # Batch encode with threading
+            ids_list = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
+
+            # If no prepend/append, return as-is
+            if prepend is None and append is None:
+                return ids_list
+
+            # Precompute prepend and append lists for efficiency
+            prepend_seq = [prepend_id] if prepend is not None else []
+            append_seq = [append_id] if append is not None else []
+
+            # Use list comprehensions + deque or pre-allocation isn't worth it here
+            return [
+                prepend_seq + ids_row + append_seq
+                for ids_row in ids_list
+            ]
+
+        else:
+            raise ValueError(f"Invalid input type: {type(text)}")
+
+
+    def encode_optimized2(self, text, prepend=None, append=None, num_threads=8):
+        # Pre-calculate prepend/append IDs once
+        prepend_id = prepend if isinstance(prepend, int) else self.encode_special(prepend) if prepend is not None else None
+        append_id = append if isinstance(append, int) else self.encode_special(append) if append is not None else None
+        
+        # Calculate total extra length needed for prepend/append
+        extra_length = (1 if prepend_id is not None else 0) + (1 if append_id is not None else 0)
+        
+        if isinstance(text, str):
+            # For single string, create list with exact known final size
+            base_ids = self.enc.encode_ordinary(text)
+            if extra_length == 0:
+                return base_ids
+                
+            result = []
+            result.extend([0] * (len(base_ids) + extra_length))  # Preallocate with correct size
+            
+            pos = 0
+            if prepend_id is not None:
+                result[0] = prepend_id
+                pos = 1
+                
+            # Copy main content using slice assignment - more efficient than individual appends
+            result[pos:pos + len(base_ids)] = base_ids
+            
+            if append_id is not None:
+                result[pos + len(base_ids)] = append_id
+                
+            return result
+            
+        elif isinstance(text, list):
+            # For batch processing, avoid individual list modifications
+            base_ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
+            
+            if extra_length == 0:
+                return base_ids
+                
+            # Preallocate the final result list
+            result = []
+            result.extend([[] for _ in range(len(base_ids))])
+            
+            # Process each row with minimal allocations
+            for i, ids_row in enumerate(base_ids):
+                new_row = []
+                new_row.extend([0] * (len(ids_row) + extra_length))  # Preallocate with correct size
+                
+                pos = 0
+                if prepend_id is not None:
+                    new_row[0] = prepend_id
+                    pos = 1
+                    
+                # Copy main content using slice assignment
+                new_row[pos:pos + len(ids_row)] = ids_row
+                
+                if append_id is not None:
+                    new_row[pos + len(ids_row)] = append_id
+                    
+                result[i] = new_row
+                
+            return result
+            
+        raise ValueError(f"Invalid input type: {type(text)}")
+
+    
+    def _token_to_str(self, token):
+        return self.enc.decode([token]) if isinstance(token, int) else token
+
+    def encode_optimized3(self, text, prepend=None, append=None, num_threads=8):
+        prepend_str = prepend if isinstance(prepend, str) else self._token_to_str(prepend)
+        append_str  = append if isinstance(append, str) else self._token_to_str(append)
+
+        if isinstance(text, str):
+            parts = [p for p in (prepend_str, text, append_str) if p is not None]
+            # Build allowed_special set for special tokens
+            allowed_special = set()
+            if prepend_str is not None:
+                allowed_special.add(prepend_str)
+            if append_str is not None:
+                allowed_special.add(append_str)
+            
+            if allowed_special:
+                return self.enc.encode(''.join(parts), allowed_special=allowed_special)
+            else:
+                return self.enc.encode(''.join(parts))
+
+        if not isinstance(text, list):
+            raise ValueError(f"Invalid input type: {type(text)}")
+
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+
+        max_workers = max(1, os.cpu_count() // 2)
+        has_prepend = prepend_str is not None
+        has_append = append_str is not None
+
+        def make_full(t):
+            if has_prepend and has_append:
+                return prepend_str + t + append_str
+            if has_prepend:
+                return prepend_str + t
+            if has_append:
+                return t + append_str
+            return t
+
+        if len(text) < max_workers * 4:  # For small batches, avoid thread overhead
+            full_texts = [make_full(t) for t in text]
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                full_texts = list(executor.map(make_full, text))
+
+        # Build allowed_special set for special tokens
+        allowed_special = set()
+        if prepend_str is not None:
+            allowed_special.add(prepend_str)
+        if append_str is not None:
+            allowed_special.add(append_str)
+        
+        if allowed_special:
+            return self.enc.encode_batch(full_texts, allowed_special=allowed_special, num_threads=num_threads)
+        else:
+            return self.enc.encode_batch(full_texts, num_threads=num_threads)
 
     def __call__(self, *args, **kwargs):
         return self.encode(*args, **kwargs)
